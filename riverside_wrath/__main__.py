@@ -5,8 +5,10 @@ Run with:  python3 -m riverside_wrath
 
 import curses
 import json
+import math
 import os
 import sys
+import tempfile
 import time
 
 from . import __version__
@@ -49,18 +51,56 @@ def load_scores():
         pass
     try:
         data = json.loads(raw)
-        return {"best": int(data.get("best", 0)),
-                "scores": data.get("scores", [])[:MAX_SCORES]}
-    except (ValueError, AttributeError):
+    except ValueError:
         return {"best": 0, "scores": []}
+    if isinstance(data, (int, float)):
+        return {"best": int(data), "scores": []}
+    if not isinstance(data, dict):
+        return {"best": 0, "scores": []}
+    try:
+        best = max(0, int(data.get("best", 0)))
+    except (ValueError, TypeError):
+        best = 0
+    # Discard malformed score entries instead of handing a bad
+    # structure to qualifies()/record_score(), which would crash on it
+    # (e.g. scores stored as a string slices to "notal", not a list).
+    scores = []
+    if isinstance(data.get("scores"), list):
+        for entry in data["scores"]:
+            if not isinstance(entry, dict):
+                continue
+            try:
+                score = int(entry["score"])
+            except (KeyError, ValueError, TypeError):
+                continue
+            name = entry.get("name", "YOU")
+            if not isinstance(name, str):
+                name = str(name)
+            scores.append({"name": name[:3].upper() or "YOU", "score": score})
+    scores.sort(key=lambda s: s["score"], reverse=True)
+    return {"best": best, "scores": scores[:MAX_SCORES]}
 
 
 def save_scores(data):
+    # Write atomically: writing straight to BEST_FILE left a
+    # half-written, unparseable file (and a lost best score) if the
+    # game was killed mid-write. Write a temp file in the same
+    # directory, then replace the old file in one step.
+    tmp_path = None
     try:
-        with open(BEST_FILE, "w") as fh:
+        directory = os.path.dirname(BEST_FILE) or "."
+        with tempfile.NamedTemporaryFile("w", dir=directory,
+                                        prefix=".riverside-wrath-best.",
+                                        suffix=".tmp", delete=False) as fh:
+            tmp_path = fh.name
             json.dump(data, fh)
+        os.replace(tmp_path, BEST_FILE)
     except OSError:
-        pass
+        if tmp_path is not None:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
 
 
 def qualifies(data, score):
@@ -90,6 +130,9 @@ def init_colors():
 
 
 def bar(label, value, width=10):
+    # Clamp: without this, a value over 100 drew a bar longer than
+    # `width` (15 '#' for 150%) and a negative value drew 11 '-'.
+    value = max(0, min(100, value))
     filled = int(round(value / 100 * width))
     return "{} [{}{}] {:>3}%".format(
         label, "#" * filled, "-" * (width - filled), int(value))
@@ -167,7 +210,11 @@ def draw(stdscr, game, best, paused):
     stdscr.addstr(1, 0, status[:w - 1], curses.color_pair(7))
     # surge cooldown indicator
     if game.surge_cooldown > 0:
-        cd = " Surge ready in {}".format((game.surge_cooldown + 9) // 10)
+        # Cooldown is in ticks, not tenths of a second: the old
+        # (cooldown + 9) // 10 said 2s for 11 ticks, which is really
+        # 11 * 0.08 = 0.88s, i.e. 1s.
+        seconds = math.ceil(game.surge_cooldown * TICK_SECONDS)
+        cd = " Surge ready in {}".format(seconds)
         stdscr.addstr(1, max(0, w - len(cd) - 1), cd[:w - 1], curses.color_pair(7) | curses.A_DIM)
     hint = "move: up/down or W/S    surge: SPACE    wrath: X    pause: P    quit: Q"
     stdscr.addstr(h - 1, 0, hint[:w - 1], curses.color_pair(7) | curses.A_DIM)
@@ -307,6 +354,10 @@ def play(stdscr, data, difficulty="normal", seed=None):
                     _flash()
                 if game.score > data["best"]:
                     data["best"] = game.score
+                    # Save straight away: the best was only written at
+                    # game over before, so quitting (Q) mid-game with a
+                    # new best lost it on the next launch.
+                    save_scores(data)
             draw(stdscr, game, data["best"], paused)
             stdscr.refresh()
             last = now
@@ -361,32 +412,56 @@ def run(argv=None):
         print("options:")
         print("  --difficulty {calm,normal,raging}  game difficulty (default: normal)")
         print("  --seed N                            random seed for reproducible runs")
+        print("  --help, -h                          show this help and exit")
+        print("  --version, -V                       show the version and exit")
         return
     # parse game options
     difficulty = "normal"
     seed = None
     i = 0
     while i < len(args):
-        if args[i] == "--difficulty" and i + 1 < len(args):
-            if args[i + 1] in ("calm", "normal", "raging"):
-                difficulty = args[i + 1]
-            else:
-                print("Unknown difficulty: {}".format(args[i + 1]), file=sys.stderr)
+        arg = args[i]
+        # Accept both "--difficulty raging" and "--difficulty=raging".
+        if arg.startswith("--difficulty="):
+            value = arg.split("=", 1)[1]
+            name, consumed = "--difficulty", 1
+        elif arg == "--difficulty":
+            if i + 1 >= len(args):
+                print("Missing value for --difficulty", file=sys.stderr)
                 print("Choose from: calm, normal, raging", file=sys.stderr)
                 return
-            i += 2
-        elif args[i] == "--seed" and i + 1 < len(args):
-            try:
-                seed = int(args[i + 1])
-            except ValueError:
-                print("Seed must be an integer: {}".format(args[i + 1]), file=sys.stderr)
+            value = args[i + 1]
+            name, consumed = "--difficulty", 2
+        elif arg.startswith("--seed="):
+            value = arg.split("=", 1)[1]
+            name, consumed = "--seed", 1
+        elif arg == "--seed":
+            if i + 1 >= len(args):
+                print("Missing value for --seed", file=sys.stderr)
+                print("Seed must be an integer", file=sys.stderr)
                 return
-            i += 2
-        elif args[i].startswith("-"):
-            print("Unknown option: {}".format(args[i]), file=sys.stderr)
+            value = args[i + 1]
+            name, consumed = "--seed", 2
+        elif arg.startswith("-"):
+            print("Unknown option: {}".format(arg), file=sys.stderr)
             return
         else:
-            i += 1
+            print("Unknown argument: {}".format(arg), file=sys.stderr)
+            return
+        if name == "--difficulty":
+            if value in ("calm", "normal", "raging"):
+                difficulty = value
+            else:
+                print("Unknown difficulty: {}".format(value), file=sys.stderr)
+                print("Choose from: calm, normal, raging", file=sys.stderr)
+                return
+        else:  # --seed
+            try:
+                seed = int(value)
+            except ValueError:
+                print("Seed must be an integer: {}".format(value), file=sys.stderr)
+                return
+        i += consumed
     try:
         curses.wrapper(lambda stdscr: main(stdscr, difficulty=difficulty, seed=seed))
     except curses.error:

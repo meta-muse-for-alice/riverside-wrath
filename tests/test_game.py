@@ -152,6 +152,30 @@ def test_combo_multiplies_chained_cleanses():
     assert g.score == before + 10, "fresh combo should score base points"
 
 
+def test_wrath_unleash_scores_half_rate():
+    g = GameState(seed=5)
+    g.spawn_timer = 10 ** 9
+    g.wrath = 100
+    g.trash = [{"x": 10, "y": 10, "cd": 5, "kind": "trash"},
+               {"x": 12, "y": 12, "cd": 5, "kind": "sludge"}]
+    assert g.unleash_wrath() is True
+    assert g.score == (GameState.TRASH_SCORE // 2
+                       + GameState.SLUDGE_SCORE // 2), \
+        "flood should pay half the surge rate per item, got {}".format(g.score)
+
+
+def test_wrath_unleash_resets_combo():
+    g = GameState(seed=5)
+    g.spawn_timer = 10 ** 9
+    g.wrath = 100
+    g.combo = 3
+    g.combo_timer = GameState.COMBO_WINDOW
+    g.trash = [{"x": 10, "y": 10, "cd": 5, "kind": "trash"}]
+    assert g.unleash_wrath() is True
+    assert g.combo == 0 and g.combo_timer == 0, \
+        "a flood that clears the river should end the combo"
+
+
 def test_breach_resets_combo():
     g = GameState(seed=10)
     g.spawn_timer = 10 ** 9
@@ -173,6 +197,30 @@ def test_dumper_dumps_triple_trash():
     assert len(g.trash) == 3, "dumper should dump three trash, got {}".format(len(g.trash))
     ys = sorted(t["y"] for t in g.trash)
     assert ys == [9, 10, 11], "dumper trash should fan out vertically"
+
+
+def test_dumper_at_edge_dumps_distinct_rows():
+    for y, expected in ((PLAY_TOP, [PLAY_TOP, PLAY_TOP + 1, PLAY_TOP + 2]),):
+        g = GameState(seed=11)
+        g.spawn_timer = 10 ** 9
+        edge = g.river_left - 1
+        g.polluters.append({"x": edge, "y": y, "side": -1, "kind": "dumper",
+                            "state": "litter", "t": 10})
+        for _ in range(3):  # toss happens when the litter timer hits 7
+            g.tick()
+        assert len(g.trash) == 3, "dumper should dump three trash"
+        assert sorted(t["y"] for t in g.trash) == expected, \
+            "dumper at the top edge should fan out, not stack two trash on one row"
+    g = GameState(seed=11)
+    g.spawn_timer = 10 ** 9
+    edge = g.river_left - 1
+    g.polluters.append({"x": edge, "y": g.play_bottom, "side": -1, "kind": "dumper",
+                        "state": "litter", "t": 10})
+    for _ in range(3):
+        g.tick()
+    ys = sorted(t["y"] for t in g.trash)
+    assert ys == [g.play_bottom - 2, g.play_bottom - 1, g.play_bottom], \
+        "dumper at the bottom edge should fan out, got {}".format(ys)
 
 
 def test_dumper_scare_worth_more():
@@ -225,6 +273,17 @@ def test_cli_help_flag_skips_curses():
     assert "difficulty" in buf.getvalue().lower(), "help should mention difficulty"
 
 
+def test_cli_help_lists_help_and_version():
+    import io
+    from contextlib import redirect_stdout
+    from riverside_wrath import __main__ as front
+    buf = io.StringIO()
+    with redirect_stdout(buf):
+        front.run(["--help"])
+    assert "--help, -h" in buf.getvalue(), "help should list --help"
+    assert "--version, -V" in buf.getvalue(), "help should list --version"
+
+
 def test_difficulty_affects_spawn_rate():
     from riverside_wrath.game import DIFFICULTIES
     calm = GameState(seed=1, difficulty="calm")
@@ -259,6 +318,158 @@ def test_level_progress():
     g.tick()
     assert g.level == 2
     assert g.score_to_next_level() == 250
+
+
+def test_draw_surge_cooldown_shows_real_seconds():
+    import curses
+    from unittest import mock
+    from riverside_wrath import __main__ as front
+
+    class FakeScr:
+        def __init__(self):
+            self.strs = []
+
+        def getmaxyx(self):
+            return (24, 80)
+
+        def addch(self, y, x, ch, attr=0):
+            pass
+
+        def addstr(self, y, x, s, attr=0):
+            self.strs.append(s)
+
+    for cooldown, expected in ((11, "Surge ready in 1"), (14, "Surge ready in 2")):
+        g = GameState(seed=1)
+        g.surge_cooldown = cooldown
+        scr = FakeScr()
+        with mock.patch.object(curses, "color_pair", return_value=0):
+            front.draw(scr, g, 0, False)
+        assert any(expected in s for s in scr.strs), \
+            "cooldown {} ticks ({}s) should show '{}', got {}".format(
+                cooldown, cooldown * front.TICK_SECONDS, expected, scr.strs)
+
+
+def test_bar_clamps_out_of_range_values():
+    from riverside_wrath import __main__ as front
+    assert front.bar("Wrath", 150) == "Wrath [##########] 100%"
+    assert front.bar("Wrath", -10) == "Wrath [----------]   0%"
+    assert front.bar("Wrath", 50) == "Wrath [#####-----]  50%"
+
+
+def test_invalid_difficulty_raises_value_error():
+    try:
+        GameState(seed=1, difficulty="bogus")
+    except ValueError as exc:
+        assert "bogus" in str(exc) and "calm" in str(exc)
+    else:
+        raise AssertionError("unknown difficulty should raise ValueError, not KeyError")
+
+
+def test_difficulty_preset_is_not_shared():
+    from riverside_wrath.game import DIFFICULTIES
+    g1 = GameState(seed=1, difficulty="normal")
+    g1._diff["spawn_base"] = 999
+    assert DIFFICULTIES["normal"]["spawn_base"] != 999, \
+        "mutating one game must not rewrite the shared preset"
+    g2 = GameState(seed=1, difficulty="normal")
+    assert g2._diff["spawn_base"] == DIFFICULTIES["normal"]["spawn_base"]
+
+
+def test_tiny_board_raises_value_error():
+    for width, height in ((10, 24), (80, 5), (13, 6)):
+        try:
+            GameState(width=width, height=height, seed=1)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(
+                "GameState({}x{}) should raise ValueError".format(width, height))
+
+
+def test_load_scores_discards_malformed_entries():
+    import json
+    import tempfile
+    from riverside_wrath import __main__ as front
+    cases = [
+        ({"best": 10, "scores": "notalist"},
+         {"best": 10, "scores": []}),
+        ({"best": 10, "scores": [{"name": "AAA", "score": 30},
+                                  {"name": "BBB"}, "junk",
+                                  {"name": "CCC", "score": "not-a-score"},
+                                  {"name": "DDD", "score": 20}]},
+         {"best": 10, "scores": [{"name": "AAA", "score": 30},
+                                  {"name": "DDD", "score": 20}]}),
+        ({"best": "not-a-number", "scores": []},
+         {"best": 0, "scores": []}),
+        ([1, 2, 3], {"best": 0, "scores": []}),
+    ]
+    for raw, expected in cases:
+        with tempfile.NamedTemporaryFile("w", delete=False) as fh:
+            json.dump(raw, fh)
+            path = fh.name
+        orig = front.BEST_FILE
+        try:
+            front.BEST_FILE = path
+            data = front.load_scores()
+            assert data == expected, "load_scores({!r}) gave {!r}".format(raw, data)
+            # the cleaned data must be usable, not crash qualifies/record_score
+            assert front.qualifies(data, 5) is True
+            front.record_score(data, "ZZZ", 5)
+        finally:
+            front.BEST_FILE = orig
+            os.unlink(path)
+
+
+def test_save_scores_is_atomic_and_round_trips():
+    import tempfile
+    from riverside_wrath import __main__ as front
+    orig = front.BEST_FILE
+    with tempfile.TemporaryDirectory() as directory:
+        try:
+            front.BEST_FILE = os.path.join(directory, "best")
+            data = {"best": 42, "scores": [{"name": "AAA", "score": 42}]}
+            front.save_scores(data)
+            assert os.listdir(directory) == ["best"], \
+                "save_scores should leave no temp file behind"
+            assert front.load_scores() == data
+        finally:
+            front.BEST_FILE = orig
+
+
+def test_cli_rejects_unknown_positional():
+    import io
+    from contextlib import redirect_stderr, redirect_stdout
+    from riverside_wrath import __main__ as front
+    buf, err = io.StringIO(), io.StringIO()
+    with redirect_stdout(buf), redirect_stderr(err):
+        front.run(["mystery-river"])
+    assert "Unknown argument: mystery-river" in err.getvalue()
+    assert "needs a real terminal" not in buf.getvalue(), \
+        "a stray argument should not start the game"
+
+
+def test_cli_missing_option_value():
+    import io
+    from contextlib import redirect_stderr, redirect_stdout
+    from riverside_wrath import __main__ as front
+    for args, expected in ((["--difficulty"], "Missing value for --difficulty"),
+                           (["--seed"], "Missing value for --seed")):
+        buf, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(buf), redirect_stderr(err):
+            front.run(args)
+        assert expected in err.getvalue(), "run({}) should report {}".format(args, expected)
+
+
+def test_cli_rejects_bad_equals_form():
+    import io
+    from contextlib import redirect_stderr, redirect_stdout
+    from riverside_wrath import __main__ as front
+    for args, expected in ((["--difficulty=bogus"], "Unknown difficulty: bogus"),
+                           (["--seed=abc"], "Seed must be an integer: abc")):
+        buf, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(buf), redirect_stderr(err):
+            front.run(args)
+        assert expected in err.getvalue(), "run({}) should report {}".format(args, expected)
 
 
 def test_trash_near_estuary_warning():

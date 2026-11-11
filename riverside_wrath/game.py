@@ -42,11 +42,23 @@ class GameState:
 
     def __init__(self, width: int = 80, height: int = 24, seed: int | None = None,
                  difficulty: DifficultyName = "normal"):
+        if difficulty not in DIFFICULTIES:
+            raise ValueError(
+                "Unknown difficulty: {!r}. Choose from: {}".format(
+                    difficulty, ", ".join(sorted(DIFFICULTIES))))
+        if width < 14 or height < 7:
+            # The river is mid +/- 6, and the play area runs from row 2
+            # to height - 3; anything smaller leaves no bank or no play area.
+            raise ValueError(
+                "Board too small: need at least 14x7, got {}x{}".format(width, height))
         self.width = width
         self.height = height
         self.rng = random.Random(seed)
         self.difficulty: DifficultyName = difficulty
-        self._diff = DIFFICULTIES[difficulty]
+        # Copy the preset: it used to alias the shared DIFFICULTIES
+        # dict, so mutating one game's _diff silently changed the
+        # preset for every GameState created afterwards.
+        self._diff = dict(DIFFICULTIES[difficulty])
         self.play_bottom = height - 3
         mid = width // 2
         self.river_left = mid - 6
@@ -112,13 +124,20 @@ class GameState:
         """Unleash the flood. Returns True if the wrath was ready."""
         if self.game_over or self.wrath < 100:
             return False
-        self.score += sum(10 if t["kind"] == "sludge" else 5 for t in self.trash)
+        # A mass clear pays half the per-item surge rate (5/10, not
+        # 10/20): say so with the constants instead of magic numbers.
+        self.score += sum(self.SLUDGE_SCORE // 2 if t["kind"] == "sludge"
+                          else self.TRASH_SCORE // 2 for t in self.trash)
         self.score += sum(self.DUMPER_SCORE if p["kind"] == "dumper"
                           else self.POLLUTER_SCORE for p in self.polluters)
         self.cleansed += len(self.trash)
         self.trash = []
         self.polluters = []
         self.wrath = 0
+        # The flood clears the river, so the combo chain ends with it,
+        # just as a breach breaks the combo.
+        self.combo = 0
+        self.combo_timer = 0
         self.purity = min(100, self.purity + 15)
         self.flood_ttl = self.height
         return True
@@ -255,8 +274,11 @@ class GameState:
         speed = int(self._trash_speed() * 1.5) if kind == "sludge" else self._trash_speed()
         x = self.river_left + 1 if p["side"] < 0 else self.river_right - 1
         if p["kind"] == "dumper":
-            for dy in (-1, 0, 1):  # dumpers unload a whole column
-                y = max(PLAY_TOP, min(self.play_bottom, p["y"] + dy))
+            # Dumpers unload a whole column. Shift the fan instead of
+            # clamping it, so a dumper at the top/bottom edge drops
+            # three distinct rows rather than two trash on one cell.
+            start = max(PLAY_TOP, min(self.play_bottom - 2, p["y"] - 1))
+            for y in (start, start + 1, start + 2):
                 self.trash.append({"x": x, "y": y, "cd": speed, "kind": kind})
         else:
             self.trash.append({"x": x, "y": p["y"], "cd": speed, "kind": kind})
